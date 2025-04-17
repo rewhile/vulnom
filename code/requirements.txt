@@ -1,0 +1,8 @@
+torch==2.4.1
+torch-geometric==2.6.1
+scikit-learn==1.6.1
+tensorboardX==2.6.2
+dgl==2.4.0+cu124
+scipy==1.15.2
+pyyaml==6.0.2
+transformers==4.51.3
