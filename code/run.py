@@ -10,6 +10,7 @@ import random
 import scipy.sparse as sp
 import numpy as np
 import torch
+torch.cuda.empty_cache()
 import csv
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler,TensorDataset
 from torch.utils.data.distributed import DistributedSampler
@@ -197,10 +198,12 @@ def build_graph(node_idxs, nodes_edges, num_nodes, edges_label, w_embeddings, ar
 
     features_out = []
     for node_idx in node_idxs:
-        emb_seq = []
-        for token in node_idx:
-            emb_seq.append(w_embeddings[token])
-        emb_seq = torch.tensor(emb_seq)
+        # emb_seq = []
+        # for token in node_idx:
+        #     emb_seq.append(w_embeddings[token])
+        # emb_seq = torch.tensor(emb_seq)
+        emb_np = np.stack([w_embeddings[token] for token in node_idx], axis=0)
+        emb_seq = torch.from_numpy(emb_np).float()
         features_out.append(emb_seq)
 
     return adj_list, features_out
@@ -256,14 +259,31 @@ class TextDataset(Dataset):
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, i):
-        adj, x_feature = build_graph(self.examples[i].all_ids, self.examples[i].edges, self.examples[i].num_nodes, self.examples[i].edges_label, self.w_embeddings, self.args)
-        adj, adj_mask = preprocess_adj(adj, self.args.block_size)
-        adj_feature = preprocess_features(x_feature, self.args.block_size)
+    # def __getitem__(self, i):
+    #     adj, x_feature = build_graph(self.examples[i].all_ids, self.examples[i].edges, self.examples[i].num_nodes, self.examples[i].edges_label, self.w_embeddings, self.args)
+    #     adj, adj_mask = preprocess_adj(adj, self.args.block_size)
+    #     adj_feature = preprocess_features(x_feature, self.args.block_size)
 
+    #     label_ = self.examples[i].label
+
+    #     return torch.tensor(adj), torch.tensor(adj_mask), torch.tensor(adj_feature), torch.tensor(label_)
+    def __getitem__(self, i):
+        adj_list, x_feature = build_graph(self.examples[i].all_ids, self.examples[i].edges, self.examples[i].num_nodes, self.examples[i].edges_label, self.w_embeddings, self.args)
+        adj_padded_list, adj_mask = preprocess_adj(adj_list, self.args.block_size)
+        adj_feature = preprocess_features(x_feature, self.args.block_size)
         label_ = self.examples[i].label
 
-        return torch.tensor(adj), torch.tensor(adj_mask), torch.tensor(adj_feature), torch.tensor(label_)
+        # ---- new: stack adjacencies into one NumPy array ----
+        import numpy as np
+        # adj_padded_list: list of (N×N) arrays, one per relation
+        adj_np = np.stack(adj_padded_list, axis=0)     # shape: (num_relations, N, N)
+        # now convert all at once
+        adj_tensor       = torch.from_numpy(adj_np).float()
+        adj_mask_tensor  = torch.from_numpy(adj_mask).float()
+        feat_tensor      = torch.from_numpy(adj_feature).float()
+        label_tensor     = torch.tensor(label_).float()
+
+        return adj_tensor, adj_mask_tensor, feat_tensor, label_tensor
 
 
 def set_seed(seed=42):
@@ -341,12 +361,14 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
     model.zero_grad()
 
     my_metrics = []
-    for idx in range(args.start_epoch, int(args.num_train_epochs)):
+    # for idx in range(args.start_epoch, int(args.num_train_epochs)):
+    for idx in trange(args.start_epoch, int(args.num_train_epochs), desc="Epoch"):
         tr_num = 0
         train_loss = 0
 
         # for step, batch in enumerate(bar):
-        for step, batch in enumerate(train_dataloader):
+        # for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(tqdm(train_dataloader, desc=f"Training (epoch {idx+1})", leave=False)):
             adj = batch[0].to(args.device)
             adj_mask = batch[1].to(args.device)
             adj_feature = batch[2].to(args.device)
@@ -458,7 +480,8 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
     model.eval()
     logits = []
     labels = []
-    for batch in eval_dataloader:
+    # for batch in eval_dataloader:
+    for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
         adj = batch[0].to(args.device)
         adj_mask = batch[1].to(args.device)
         adj_feature = batch[2].to(args.device)
@@ -594,9 +617,9 @@ def main():
     parser.add_argument("--do_lower_case", action='store_true',
                         help="Set this flag if you are using an uncased model.")
 
-    parser.add_argument("--train_batch_size", default=4, type=int,
+    parser.add_argument("--train_batch_size", default=16, type=int,
                         help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--eval_batch_size", default=4, type=int,
+    parser.add_argument("--eval_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -674,14 +697,19 @@ def main():
         "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
         "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
         "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
-        "--block_size", "400",
+        # "--block_size", "400",
+        "--block_size", "256",
+        "--fp16",
         "--train_batch_size", "32",
-        "--eval_batch_size", "32",
+        # "--train_batch_size", "8",
+        # "--eval_batch_size", "32",
+        "--eval_batch_size", "8",
         "--max_grad_norm", "1.0",
         "--evaluate_during_training",
         "--gnn", "ReGCN",
         "--learning_rate", "5e-4",
-        "--epoch", "200",
+        # "--epoch", "200",
+        "--epoch", "10",
         "--hidden_size", "128",
         "--num_GNN_layers", "2",
         "--seed", "123456",

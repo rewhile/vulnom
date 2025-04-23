@@ -1,3 +1,5 @@
 dataset/NVD
 dataset/GITA
 dataset.zip
+code/saved_models
+__pycache__/

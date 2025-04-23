@@ -1,4 +1,4 @@
-torch==2.4.1
+torch==2.4.0
 torch-geometric==2.6.1
 scikit-learn==1.6.1
 tensorboardX==2.6.2

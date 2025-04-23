@@ -86,7 +86,7 @@ class GNNReGVD(nn.Module):
     def forward(self, adj=None, adj_mask=None, adj_feature=None, labels=None):
         # run over GNNs
         adj = torch.squeeze((adj))
-        outputs = self.gnn(adj_feature.to(device).double(), adj.to(device).double(), adj_mask.to(device).double())
+        outputs = self.gnn(adj_feature.to(device).float(), adj.to(device).float(), adj_mask.to(device).float())
         logits = self.classifier(outputs)
         prob = F.sigmoid(logits)
         if labels is not None:
