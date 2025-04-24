@@ -66,6 +66,7 @@ class ReGGNN(nn.Module):
             else:
                 x = self.gatedGNN(x.float(), adj.float()) * mask.float()
         # soft attention
+        self.last_node_vecs = x            # ★ store node-embs BEFORE pooling
         soft_att = torch.sigmoid(self.soft_att(x))
         x = self.act(self.ln(x))
         x = soft_att * x * mask
@@ -135,6 +136,7 @@ class ReGCN(nn.Module):
         attn_node = attn_node / math.sqrt(self.hidden_size)
         attn_probs = torch.nn.functional.softmax(attn_node, dim=-1)
         context = torch.matmul(attn_probs, value)
+        self.last_node_vecs = context      # ★ store node embs
         graph_embeddings = torch.sum(context, 1) * torch.amax(context, 1)
 
         return graph_embeddings

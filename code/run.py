@@ -124,6 +124,7 @@ class InputFeatures(object):
                  num_nodes,
                  idx,
                  label,
+                 node_target
 
     ):
         self.all_ids = all_ids,
@@ -132,6 +133,7 @@ class InputFeatures(object):
         self.num_nodes = num_nodes
         self.idx = str(idx)
         self.label = label
+        self.node_target = node_target
 
 
 def convert_graphs_to_features(js,tokenizer, args):
@@ -163,7 +165,7 @@ def convert_graphs_to_features(js,tokenizer, args):
     if num_nodes == 0:
         return None
 
-    return InputFeatures(all_ids, edges, edges_label, num_nodes, js['idx'], js['target'])
+    return InputFeatures(all_ids, edges, edges_label, num_nodes, js['idx'], js['target'], js['node_target'])
 
 def convert_codes_to_tokens(js, args):
     codes = js['nodes_codes']
@@ -231,7 +233,7 @@ def convert_examples_to_features(js,tokenizer,args):
     source_ids = tokenizer.convert_tokens_to_ids(source_tokens)
     padding_length = args.block_size - len(source_ids)
     source_ids+=[tokenizer.pad_token_id]*padding_length
-    return InputFeatures(source_tokens,source_ids,js['idx'],js['target'])
+    return InputFeatures(source_tokens,source_ids,js['idx'],js['target'],js['node_target'])
 
 
 class TextDataset(Dataset):
@@ -268,22 +270,43 @@ class TextDataset(Dataset):
 
     #     return torch.tensor(adj), torch.tensor(adj_mask), torch.tensor(adj_feature), torch.tensor(label_)
     def __getitem__(self, i):
-        adj_list, x_feature = build_graph(self.examples[i].all_ids, self.examples[i].edges, self.examples[i].num_nodes, self.examples[i].edges_label, self.w_embeddings, self.args)
+        adj_list, x_feature = build_graph(
+            self.examples[i].all_ids,
+            self.examples[i].edges,
+            self.examples[i].num_nodes,
+            self.examples[i].edges_label,
+            self.w_embeddings,
+            self.args
+        )
+
+        # --- graph-level pads (already fixed before) ---
         adj_padded_list, adj_mask = preprocess_adj(adj_list, self.args.block_size)
-        adj_feature = preprocess_features(x_feature, self.args.block_size)
-        label_ = self.examples[i].label
+        adj_feature               = preprocess_features(x_feature, self.args.block_size)
 
-        # ---- new: stack adjacencies into one NumPy array ----
-        import numpy as np
-        # adj_padded_list: list of (N×N) arrays, one per relation
-        adj_np = np.stack(adj_padded_list, axis=0)     # shape: (num_relations, N, N)
-        # now convert all at once
-        adj_tensor       = torch.from_numpy(adj_np).float()
-        adj_mask_tensor  = torch.from_numpy(adj_mask).float()
-        feat_tensor      = torch.from_numpy(adj_feature).float()
-        label_tensor     = torch.tensor(label_).float()
+        # --- NEW: pad node targets & create mask --------------------
+        node_targets        = self.examples[i].node_target          # list/1-D array
+        nt_len              = len(node_targets)
+        pad_len             = self.args.block_size - nt_len
+        if pad_len < 0:                       # truncate too-long graphs
+            node_targets = node_targets[:self.args.block_size]
+            nt_len       = self.args.block_size
+            pad_len      = 0
+        node_targets_padded = np.pad(node_targets, (0, pad_len), "constant")
+        node_mask           = np.zeros(self.args.block_size, dtype=np.float32)
+        node_mask[:nt_len]  = 1.0
+        # -------------------------------------------------------------
 
-        return adj_tensor, adj_mask_tensor, feat_tensor, label_tensor
+        # convert to tensors once, all with matching shapes
+        adj_tensor      = torch.from_numpy(np.stack(adj_padded_list, 0)).float()
+        adj_mask_tensor = torch.from_numpy(adj_mask).float()
+        feat_tensor     = torch.from_numpy(adj_feature).float()
+        graph_lbl       = torch.tensor(self.examples[i].label, dtype=torch.float)
+        node_lbl        = torch.tensor(node_targets_padded, dtype=torch.float)
+        node_msk        = torch.tensor(node_mask,         dtype=torch.float)
+
+        return (adj_tensor, adj_mask_tensor, feat_tensor,
+                graph_lbl,  node_lbl,         node_msk)
+
 
 
 def set_seed(seed=42):
@@ -369,12 +392,16 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         # for step, batch in enumerate(bar):
         # for step, batch in enumerate(train_dataloader):
         for step, batch in enumerate(tqdm(train_dataloader, desc=f"Training (epoch {idx+1})", leave=False)):
-            adj = batch[0].to(args.device)
-            adj_mask = batch[1].to(args.device)
-            adj_feature = batch[2].to(args.device)
-            labels = batch[3].to(args.device)
+        #     adj = batch[0].to(args.device)
+        #     adj_mask = batch[1].to(args.device)
+        #     adj_feature = batch[2].to(args.device)
+        #     labels = batch[3].to(args.device)
+        #     n_label = batch[4].to(args.device)
+        #     model.train()
+        #     loss, logits = model(adj, adj_mask, adj_feature, labels, n_label)
+            adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk = (t.to(args.device) for t in batch)
             model.train()
-            loss, logits = model(adj, adj_mask, adj_feature, labels)
+            loss, _, _ = model(adj, adj_mask, adj_feat, graph_labels=g_lbl, node_labels =n_lbl, node_mask   =n_msk)
 
 
             if args.n_gpu > 1:
@@ -456,120 +483,143 @@ def p_r_f1(labels, preds):
     return precision, recall, f1, FPR, FNR
 
 def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
-    # Loop to handle MNLI double evaluation (matched, mis-matched)
+    """
+    Run evaluation on dev set.
+    Works for both single- and multi-GPU, handles
+    the new (adj, mask, feat, graph_lbl, node_lbl) tuples.
+    """
     eval_output_dir = args.output_dir
-
-    if not os.path.exists(eval_output_dir) and args.local_rank in [-1, 0]:
-        os.makedirs(eval_output_dir)
+    os.makedirs(eval_output_dir, exist_ok=True)
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size, num_workers=4, pin_memory=True)
+    sampler_cls = SequentialSampler if args.local_rank == -1 else DistributedSampler
+    eval_sampler    = sampler_cls(eval_dataset)
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        sampler      = eval_sampler,
+        batch_size   = args.eval_batch_size,
+        num_workers  = 4,
+        pin_memory   = True,
+    )
 
-    # multi-gpu evaluate
-    if args.n_gpu > 1 and eval_when_training is False:
+    if args.n_gpu > 1 and not eval_when_training:
         model = torch.nn.DataParallel(model)
 
-    # Eval!
     logger.info("***** Running evaluation *****")
     logger.info("  Num examples = %d", len(eval_dataset))
-    logger.info("  Batch size = %d", args.eval_batch_size)
-    eval_loss = 0.0
-    nb_eval_steps = 0
+    logger.info("  Batch size   = %d", args.eval_batch_size)
+
     model.eval()
-    logits = []
-    labels = []
-    # for batch in eval_dataloader:
+    eval_loss, nb_steps = 0.0, 0
+    all_logits, all_labels = [], []
+
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
-        adj = batch[0].to(args.device)
-        adj_mask = batch[1].to(args.device)
-        adj_feature = batch[2].to(args.device)
-        label = batch[3].to(args.device)
+        # adj         = batch[0].to(args.device)
+        # adj_mask    = batch[1].to(args.device)
+        # adj_feat    = batch[2].to(args.device)
+        # g_labels    = batch[3].to(args.device)
+        # n_labels    = batch[4].to(args.device)
+
+        # with torch.no_grad():
+        #     loss, g_logits, _ = model(
+        #         adj, adj_mask, adj_feat,
+        #         graph_labels=g_labels,
+        #         node_labels =n_labels
+        #     )
+        #     eval_loss += loss.item()
+        #     nb_steps  += 1
+        #     all_logits.append(g_logits.cpu().numpy())
+        #     all_labels.append(g_labels.cpu().numpy())
+        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk = (t.to(args.device) for t in batch)
         with torch.no_grad():
-            lm_loss, logit = model(adj, adj_mask, adj_feature, label)
-            eval_loss += lm_loss.mean().item()
-            logits.append(logit.cpu().numpy())
-            labels.append(label.cpu().numpy())
-        nb_eval_steps += 1
-    logits = np.concatenate(logits,0)
-    labels = np.concatenate(labels,0)
-    preds = logits[:,0]>0.5
+            loss, g_logits, _ = model(adj, adj_mask, adj_feat,
+                                    graph_labels=g_lbl,
+                                    node_labels =n_lbl,
+                                    node_mask   =n_msk)
 
-    eval_acc = np.mean(labels==preds)
-    eval_loss = eval_loss / nb_eval_steps
-    perplexity = torch.tensor(eval_loss)
+    eval_loss /= nb_steps
+    logits  = np.concatenate(all_logits, 0)
+    labels  = np.concatenate(all_labels, 0)
+    preds   = logits > 0.5
 
-    eval_precision, eval_recall, eval_f1, eval_FPR, eval_FNR = p_r_f1(labels, preds)
-    eval_auc = roc_auc_score(labels, preds)
-    result = {
-        "eval_loss": float(perplexity),
-        "eval_acc": round(eval_acc,4),
-        "eval_precision": round(eval_precision,4),
-        "eval_recall": round(eval_recall,4),
-        "eval_f1": round(eval_f1,4),
-        "eval_auc": round(eval_auc,4),
-        "eval_FPR":round(eval_FPR,4),
-        "eval_FNR":round(eval_FNR,4)
+    precision, recall, f1, fpr, fnr = p_r_f1(labels, preds)
+    auc = roc_auc_score(labels, preds)
+
+    return {
+        "eval_loss":     round(float(eval_loss), 6),
+        "eval_acc":      round(float(np.mean(labels == preds)), 4),
+        "eval_precision":round(precision, 4),
+        "eval_recall":   round(recall, 4),
+        "eval_f1":       round(f1, 4),
+        "eval_auc":      round(auc, 4),
+        "eval_FPR":      round(fpr, 4),
+        "eval_FNR":      round(fnr, 4),
     }
-    return result
 
-def test(args, eval_dataset, model, tokenizer):
-    # Loop to handle MNLI double evaluation (matched, mis-matched)
-
+def test(args, test_dataset, model, tokenizer):
+    """
+    Run test on held-out set and write predictions.txt
+    Works with the 5-tensor batches.
+    """
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
-    eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+    sampler_cls = SequentialSampler if args.local_rank == -1 else DistributedSampler
+    test_sampler = sampler_cls(test_dataset)
+    test_loader  = DataLoader(
+        test_dataset,
+        sampler     = test_sampler,
+        batch_size  = args.eval_batch_size,
+        num_workers = 4,
+        pin_memory  = True,
+    )
 
-    # multi-gpu evaluate
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
-    # Eval!
-    logger.info("***** Running Test *****")
-    logger.info("  Num examples = %d", len(eval_dataset))
-    logger.info("  Batch size = %d", args.eval_batch_size)
-    eval_loss = 0.0
-    nb_eval_steps = 0
+    logger.info("***** Running test *****")
+    logger.info("  Num examples = %d", len(test_dataset))
+    logger.info("  Batch size   = %d", args.eval_batch_size)
+
     model.eval()
-    logits=[]   
-    labels=[]
-    for batch in eval_dataloader:
-        adj = batch[0].to(args.device)
-        adj_mask = batch[1].to(args.device)
-        adj_feature = batch[2].to(args.device)
-        label = batch[3].to(args.device)
+    all_logits, all_labels = [], []
+
+    for batch in tqdm(test_loader, desc="Testing", leave=False):
+        # adj       = batch[0].to(args.device)
+        # adj_mask  = batch[1].to(args.device)
+        # adj_feat  = batch[2].to(args.device)
+
+        # with torch.no_grad():
+        #     g_logits, _ = model(adj, adj_mask, adj_feat)  # forward **without** labels
+        adj, adj_mask, adj_feat, *_ = (t.to(args.device) for t in batch)
         with torch.no_grad():
-            logit = model(adj, adj_mask, adj_feature)
-            logits.append(logit.cpu().numpy())
-            labels.append(label.cpu().numpy())
+            g_logits, _ = model(adj, adj_mask, adj_feat)
 
-    logits=np.concatenate(logits,0)
-    labels=np.concatenate(labels,0)
-    preds=logits[:,0]>0.5
+        all_logits.append(g_logits.cpu().numpy())
+        all_labels.append(batch[3].numpy())  # graph labels
 
-    test_acc=np.mean(labels==preds)
-    # 计算精确率和召回率，AUC
-    test_precision, test_recall, test_f1, test_FPR, test_FNR = p_r_f1(labels, preds)
-    test_auc = roc_auc_score(labels, preds)
-    with open(os.path.join(args.output_dir,"predictions.txt"),'w') as f:
-        for example,pred in zip(eval_dataset.examples,preds):
-            if pred:
-                f.write(example.idx+'\t1\n')
-            else:
-                f.write(example.idx+'\t0\n')
+    logits = np.concatenate(all_logits, 0)
+    labels = np.concatenate(all_labels, 0)
+    preds  = (logits > 0.5)
 
-    result = {
-        "test_acc": round(test_acc, 4),
-        "test_precision": round(test_precision, 4),
-        "test_recall": round(test_recall, 4),
-        "test_f1": round(test_f1, 4),
-        "test_auc": round(test_auc, 4),
-        "test_FPR": round(test_FPR, 4),
-        "test_FNR": round(test_FNR, 4)
+    precision, recall, f1, fpr, fnr = p_r_f1(labels, preds)
+    auc = roc_auc_score(labels, preds)
+
+    # --------------------------------------------------
+    #  write raw predictions for inspection / leaderboard
+    # --------------------------------------------------
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "predictions.txt"), "w") as fh:
+        for ex, p in zip(test_dataset.examples, preds):
+            fh.write(f"{ex.idx}\t{int(p)}\n")
+
+    return {
+        "test_acc":       round(float(np.mean(labels == preds)), 4),
+        "test_precision": round(precision, 4),
+        "test_recall":    round(recall, 4),
+        "test_f1":        round(f1, 4),
+        "test_auc":       round(auc, 4),
+        "test_FPR":       round(fpr, 4),
+        "test_FNR":       round(fnr, 4),
     }
-    return result
                         
 def main():
     parser = argparse.ArgumentParser()
