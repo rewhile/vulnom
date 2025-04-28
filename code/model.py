@@ -105,7 +105,13 @@ class GNNReGVD(nn.Module):
         node_logits  = self.node_cls(self.gnn.last_node_vecs).squeeze(-1) # [B,N]
 
         if graph_labels is not None and node_labels is not None:
-            crit = torch.nn.BCEWithLogitsLoss(reduction='none')
+            # crit = torch.nn.BCEWithLogitsLoss(reduction='none')
+            # use the same positive weight we computed for the sampler
+            pos_w = getattr(self.args, "pos_weight", 1.0)
+            crit  = torch.nn.BCEWithLogitsLoss(
+                        reduction='none',
+                        pos_weight=torch.tensor(pos_w, device=graph_logits.device)
+                    )
 
             # ---- graph-level --------------------------------------------------
             g_loss = crit(graph_logits, graph_labels.float()).mean()

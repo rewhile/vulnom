@@ -17,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch_geometric.data import Data
 from sklearn.metrics import roc_auc_score
 import json
+import math
 try:
     from torch.utils.tensorboard import SummaryWriter
 except:
@@ -124,7 +125,8 @@ class InputFeatures(object):
                  num_nodes,
                  idx,
                  label,
-                 node_target
+                 node_target,
+                 code_lines
 
     ):
         self.all_ids = all_ids,
@@ -134,6 +136,7 @@ class InputFeatures(object):
         self.idx = str(idx)
         self.label = label
         self.node_target = node_target
+        self.code_lines = code_lines
 
 
 def convert_graphs_to_features(js,tokenizer, args):
@@ -165,7 +168,7 @@ def convert_graphs_to_features(js,tokenizer, args):
     if num_nodes == 0:
         return None
 
-    return InputFeatures(all_ids, edges, edges_label, num_nodes, js['idx'], js['target'], js['node_target'])
+    return InputFeatures(all_ids, edges, edges_label, num_nodes, js['idx'], js['target'], js['node_target'], js['code_lines'])
 
 def convert_codes_to_tokens(js, args):
     codes = js['nodes_codes']
@@ -303,9 +306,16 @@ class TextDataset(Dataset):
         graph_lbl       = torch.tensor(self.examples[i].label, dtype=torch.float)
         node_lbl        = torch.tensor(node_targets_padded, dtype=torch.float)
         node_msk        = torch.tensor(node_mask,         dtype=torch.float)
+        lines = self.examples[i].code_lines          # <-- grab them
+        lines = lines[:self.args.block_size]
+        pad   = self.args.block_size - len(lines)
+        lines = np.pad(lines, (0, pad), "constant", constant_values=-1)
+
+        line_tensor = torch.tensor(lines, dtype=torch.float)
 
         return (adj_tensor, adj_mask_tensor, feat_tensor,
-                graph_lbl,  node_lbl,         node_msk)
+                graph_lbl,  node_lbl,         node_msk,
+                line_tensor)
 
 
 
@@ -321,12 +331,35 @@ def set_seed(seed=42):
 def train(args, train_dataset, eval_dataset, model, tokenizer):
     """ Train the model """ 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    # train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    # train_sampler = torch.utils.data.WeightedRandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    if args.local_rank == -1:                    # single-GPU / single-process
+        # ---- build per-example weights ---------------------------------
+        labels = [ex.label for ex in train_dataset.examples]   # 0 / 1
+        n_pos  = sum(labels)
+        n_neg  = len(labels) - n_pos
+        # avoid div-by-zero when there are no positives (unlikely)
+        pos_weight = (n_neg / n_pos) if n_pos else 1.0
+        sample_weights = torch.tensor(
+            [pos_weight if lbl == 1 else 1.0 for lbl in labels],
+            dtype=torch.double
+        )
+        # store for later so we can reuse in the loss
+        args.pos_weight = pos_weight
+
+        train_sampler = torch.utils.data.WeightedRandomSampler(
+            weights     = sample_weights,
+            num_samples = len(sample_weights),   # usually == dataset size
+            replacement = True
+        )
+    else:                                        # distributed case
+        train_sampler = DistributedSampler(train_dataset)
     
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
                                   batch_size=args.train_batch_size, num_workers=4, pin_memory=True)  # numworkers=4
     args.max_steps=args.epoch*len(train_dataloader)
-    args.save_steps=len(train_dataloader)
+    # args.save_steps=len(train_dataloader)
+    args.save_steps = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     args.warmup_steps=len(train_dataloader)
     args.logging_steps=len(train_dataloader)
     args.num_train_epochs=args.epoch
@@ -346,7 +379,8 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
             from apex import amp
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+        # model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level, loss_scale=1024)
 
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
@@ -399,7 +433,8 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         #     n_label = batch[4].to(args.device)
         #     model.train()
         #     loss, logits = model(adj, adj_mask, adj_feature, labels, n_label)
-            adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk = (t.to(args.device) for t in batch)
+            # ignore code_lines during training
+            adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, _ = (t.to(args.device) for t in batch)
             model.train()
             loss, _, _ = model(adj, adj_mask, adj_feat, graph_labels=g_lbl, node_labels =n_lbl, node_mask   =n_msk)
 
@@ -530,17 +565,28 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
         #     nb_steps  += 1
         #     all_logits.append(g_logits.cpu().numpy())
         #     all_labels.append(g_labels.cpu().numpy())
-        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk = (t.to(args.device) for t in batch)
+        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (t.to(args.device) for t in batch)
         with torch.no_grad():
-            loss, g_logits, _ = model(adj, adj_mask, adj_feat,
+            loss, g_logits, n_logits = model(adj, adj_mask, adj_feat,
                                     graph_labels=g_lbl,
                                     node_labels =n_lbl,
                                     node_mask   =n_msk)
+        eval_loss += loss.item()
+        nb_steps  += 1
+        all_logits.append(g_logits.cpu().numpy())
+        all_labels.append(g_lbl.cpu().numpy())
 
     eval_loss /= nb_steps
     logits  = np.concatenate(all_logits, 0)
     labels  = np.concatenate(all_labels, 0)
     preds   = logits > 0.5
+    # nothing was processed – just return zeros to avoid /0
+    if nb_steps == 0:
+        return {k: 0 for k in [
+            "eval_loss","eval_acc","eval_precision","eval_recall",
+            "eval_f1","eval_auc","eval_FPR","eval_FNR"]}
+
+    eval_loss /= nb_steps
 
     precision, recall, f1, fpr, fnr = p_r_f1(labels, preds)
     auc = roc_auc_score(labels, preds)
@@ -671,7 +717,7 @@ def main():
                         help="Batch size per GPU/CPU for training.")
     parser.add_argument("--eval_batch_size", default=8, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=4,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument("--learning_rate", default=5e-5, type=float,
                         help="The initial learning rate for Adam.")
@@ -748,10 +794,12 @@ def main():
         "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
         "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
         # "--block_size", "400",
-        "--block_size", "256",
+        # "--block_size", "256",
+        # "--block_size", "128",
+        "--block_size", "64",
         "--fp16",
-        "--train_batch_size", "32",
-        # "--train_batch_size", "8",
+        # "--train_batch_size", "32",
+        "--train_batch_size", "8",
         # "--eval_batch_size", "32",
         "--eval_batch_size", "8",
         "--max_grad_norm", "1.0",
