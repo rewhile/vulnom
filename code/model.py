@@ -86,14 +86,14 @@ class GNNReGVD(nn.Module):
         self.node_cls  = nn.Linear(args.hidden_size, 1)
 
         # optional weighting between tasks
-        self.lambda_node = getattr(args, "lambda_node", 0.2)
+        self.lambda_node = getattr(args, "lambda_node", 1.0)
 
 
     def forward(
         self, adj=None, adj_mask=None, adj_feature=None,
         graph_labels=None, node_labels=None, node_mask=None
     ):
-        adj = torch.squeeze(adj)  # [B,R,N,N]
+        # adj = torch.squeeze(adj)  # [B,R,N,N]
 
         # --- GNN encoding ------------------------------------------------
         graph_embs = self.gnn(
@@ -107,22 +107,39 @@ class GNNReGVD(nn.Module):
         if graph_labels is not None and node_labels is not None:
             # crit = torch.nn.BCEWithLogitsLoss(reduction='none')
             # use the same positive weight we computed for the sampler
-            pos_w = getattr(self.args, "pos_weight", 1.0)
-            crit  = torch.nn.BCEWithLogitsLoss(
+            # pos_w = getattr(self.args, "pos_weight", 1.0)
+            # crit  = torch.nn.BCEWithLogitsLoss(
+            #             reduction='none',
+            #             pos_weight=torch.tensor(pos_w, device=graph_logits.device)
+            #         )
+            g_crit = torch.nn.BCEWithLogitsLoss(
                         reduction='none',
-                        pos_weight=torch.tensor(pos_w, device=graph_logits.device)
+                        pos_weight=torch.tensor(getattr(self.args, "pos_weight", 1.0),
+                                                device=graph_logits.device)
+                     )
+    
+            # ─ node loss: compute batch-wise pos-weight ──────────────────
+            with torch.no_grad():
+                n_pos = (node_labels * node_mask).sum()
+                n_neg = node_mask.sum() - n_pos
+                # node_pos_w = (n_neg / (n_pos + 1e-6)).clamp(min=1.)
+                node_pos_w = (n_neg / (n_pos + 1e-6)).clamp(1., 30.)
+
+            n_crit = torch.nn.BCEWithLogitsLoss(
+                        reduction='none',
+                        pos_weight=node_pos_w
                     )
 
-            # ---- graph-level --------------------------------------------------
-            g_loss = crit(graph_logits, graph_labels.float()).mean()
+            g_loss = g_crit(graph_logits, graph_labels.float()).mean()
+            n_loss = (n_crit(node_logits, node_labels.float()) * node_mask).sum() / node_mask.sum()
 
-            # ---- node-level (ignore padded spots) ----------------------------
-            n_loss_full = crit(node_logits, node_labels.float())          # [B,N]
-            n_loss      = (n_loss_full * node_mask).sum() / node_mask.sum()
-
-            loss = g_loss + self.lambda_node * n_loss
+            loss   = g_loss + self.lambda_node * n_loss
             return (
                 loss,
                 torch.sigmoid(graph_logits),   # returned probabilities
                 torch.sigmoid(node_logits)
             )
+        return (
+            torch.sigmoid(graph_logits),        # graph-level probabilities
+            torch.sigmoid(node_logits)          # node-level probabilities
+        )

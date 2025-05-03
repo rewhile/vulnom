@@ -517,6 +517,44 @@ def p_r_f1(labels, preds):
     FNR = (FN + 1) / (TP + FN + 1)
     return precision, recall, f1, FPR, FNR
 
+# ──────────────────────────────────────────────────────────────────────────────
+def aggregate_by_line(node_probs, node_labels, line_ids, thr=0.5):
+    """
+    Convert node-level logits / labels to *line*-level 0/1 predictions & labels.
+
+    node_logits : (B,N)  – raw logits from model (already on CPU / np)
+    node_labels : (B,N)  – ground-truth node labels   (CPU / np)
+    line_ids    : (B,N)  – source line no. for each node (CPU / np, -1 = pad)
+
+    Returns two python lists with one entry per distinct source line
+    across the whole mini-batch.
+    """
+    line_preds, line_golds = [], []
+
+    for logit_row, label_row, line_row in zip(node_probs, node_labels, line_ids):
+        # keep only real nodes
+        valid = line_row >= 0
+        if valid.sum() == 0:
+            continue
+
+        # probs = 1 / (1 + np.exp(-logit_row[valid]))   # sigmoid
+        # node_pred = probs > thr
+        node_pred = logit_row[valid] > thr
+        node_gold = label_row[valid].astype(bool)
+        line_row  = line_row[valid]
+
+        for ln in np.unique(line_row):
+            mask = (line_row == ln)
+            # a line is positive if *any* of its nodes is positive
+            # line_preds.append(int(node_pred[mask].any()))
+            # Let's change to mean
+            line_score = logit_row[valid][mask].mean()
+            line_preds.append(int(line_score > thr))
+            line_golds.append(int(node_gold[mask].any()))
+
+    return line_preds, line_golds
+# ──────────────────────────────────────────────────────────────────────────────
+
 def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
     """
     Run evaluation on dev set.
@@ -546,61 +584,81 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
 
     model.eval()
     eval_loss, nb_steps = 0.0, 0
-    all_logits, all_labels = [], []
+    graph_logits_all, graph_labels_all = [], []
+    line_probs_all,  line_labels_all  = [], []
 
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
-        # adj         = batch[0].to(args.device)
-        # adj_mask    = batch[1].to(args.device)
-        # adj_feat    = batch[2].to(args.device)
-        # g_labels    = batch[3].to(args.device)
-        # n_labels    = batch[4].to(args.device)
+        # unpack & send to GPU
+        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (
+            t.to(args.device) for t in batch
+        )
 
-        # with torch.no_grad():
-        #     loss, g_logits, _ = model(
-        #         adj, adj_mask, adj_feat,
-        #         graph_labels=g_labels,
-        #         node_labels =n_labels
-        #     )
-        #     eval_loss += loss.item()
-        #     nb_steps  += 1
-        #     all_logits.append(g_logits.cpu().numpy())
-        #     all_labels.append(g_labels.cpu().numpy())
-        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (t.to(args.device) for t in batch)
         with torch.no_grad():
-            loss, g_logits, n_logits = model(adj, adj_mask, adj_feat,
-                                    graph_labels=g_lbl,
-                                    node_labels =n_lbl,
-                                    node_mask   =n_msk)
+            loss, g_logits, n_logits = model(
+                adj, adj_mask, adj_feat,
+                graph_labels=g_lbl,
+                node_labels =n_lbl,
+                node_mask   =n_msk
+            )
+
+        # ─── graph-level bookkeeping ────────────────────────────────────────
         eval_loss += loss.item()
         nb_steps  += 1
-        all_logits.append(g_logits.cpu().numpy())
-        all_labels.append(g_lbl.cpu().numpy())
+        graph_logits_all.append(g_logits.cpu().numpy())
+        graph_labels_all.append(g_lbl.cpu().numpy())
+
+        # ─── NEW: line-level bookkeeping ────────────────────────────────────
+        lp, lg = aggregate_by_line(
+            n_logits.cpu().numpy(),
+            n_lbl.cpu().numpy(),
+            line_ids.cpu().numpy()
+        )
+        line_probs_all.extend(lp)
+        line_labels_all.extend(lg)
 
     eval_loss /= nb_steps
-    logits  = np.concatenate(all_logits, 0)
-    labels  = np.concatenate(all_labels, 0)
-    preds   = logits > 0.5
-    # nothing was processed – just return zeros to avoid /0
-    if nb_steps == 0:
-        return {k: 0 for k in [
-            "eval_loss","eval_acc","eval_precision","eval_recall",
-            "eval_f1","eval_auc","eval_FPR","eval_FNR"]}
+        # ───────── graph metrics (unchanged) ────────────────────────────────────
+    graph_logits  = np.concatenate(graph_logits_all, 0)
+    graph_labels  = np.concatenate(graph_labels_all, 0)
+    # graph_preds   = graph_logits > 0.5
+    # g_prec, g_rec, g_f1, g_fpr, g_fnr = p_r_f1(graph_labels, graph_preds)
+    # g_auc = roc_auc_score(graph_labels, graph_preds)
+    graph_preds   = graph_logits > 0.5
+    g_prec, g_rec, g_f1, g_fpr, g_fnr = p_r_f1(graph_labels, graph_preds)
+    g_auc = roc_auc_score(graph_labels, graph_logits)   # <── use probs
 
-    eval_loss /= nb_steps
+    # ───────── line metrics (NEW primary target) ────────────────────────────
+    line_probs  = np.array(line_probs_all)
+    line_labels = np.array(line_labels_all)
+    best_thr, best_f1 = 0.5, -1
+    for thr in np.linspace(0.05, 0.95, 19):
+        preds_tmp = (line_probs > thr)
+        _, _, f1_tmp, _, _ = p_r_f1(line_labels, preds_tmp)
+        if f1_tmp > best_f1:
+            best_f1, best_thr = f1_tmp, thr
 
-    precision, recall, f1, fpr, fnr = p_r_f1(labels, preds)
-    auc = roc_auc_score(labels, preds)
+    line_preds = (line_probs > best_thr)
+    l_prec, l_rec, l_f1, l_fpr, l_fnr = p_r_f1(line_labels, line_preds)
+    l_auc = roc_auc_score(line_labels, line_preds)
 
     return {
-        "eval_loss":     round(float(eval_loss), 6),
-        "eval_acc":      round(float(np.mean(labels == preds)), 4),
-        "eval_precision":round(precision, 4),
-        "eval_recall":   round(recall, 4),
-        "eval_f1":       round(f1, 4),
-        "eval_auc":      round(auc, 4),
-        "eval_FPR":      round(fpr, 4),
-        "eval_FNR":      round(fnr, 4),
+        # line-level – these are now the ones used for “best-f1”
+        "eval_loss":      round(float(eval_loss/nb_steps), 6),
+        "eval_acc":       round(float(np.mean(line_labels == line_preds)), 4),
+        "eval_precision": round(l_prec, 4),
+        "eval_recall":    round(l_rec, 4),
+        "eval_f1":        round(l_f1, 4),            # <── train() looks at this
+        "eval_auc":       round(l_auc, 4),
+        "eval_FPR":       round(l_fpr, 4),
+        "eval_FNR":       round(l_fnr, 4),
+
+        # keep graph-level numbers for reference
+        "eval_graph_precision": round(g_prec, 4),
+        "eval_graph_recall":    round(g_rec, 4),
+        "eval_graph_f1":        round(g_f1, 4),
+        "eval_graph_auc":       round(g_auc, 4),
     }
+
 
 def test(args, test_dataset, model, tokenizer):
     """
@@ -626,45 +684,65 @@ def test(args, test_dataset, model, tokenizer):
     logger.info("  Batch size   = %d", args.eval_batch_size)
 
     model.eval()
-    all_logits, all_labels = [], []
+
+    graph_logits_all, graph_labels_all = [], []
+    line_probs_all,  line_labels_all   = [] , []       # <── keep PROBs
 
     for batch in tqdm(test_loader, desc="Testing", leave=False):
-        # adj       = batch[0].to(args.device)
-        # adj_mask  = batch[1].to(args.device)
-        # adj_feat  = batch[2].to(args.device)
+        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (
+            t.to(args.device) for t in batch
+        )
 
-        # with torch.no_grad():
-        #     g_logits, _ = model(adj, adj_mask, adj_feat)  # forward **without** labels
-        adj, adj_mask, adj_feat, *_ = (t.to(args.device) for t in batch)
+        # ── forward pass – the model must return *probabilities* here ──
         with torch.no_grad():
-            g_logits, _ = model(adj, adj_mask, adj_feat)
+            g_logits, n_logits = model(adj, adj_mask, adj_feat)
 
-        all_logits.append(g_logits.cpu().numpy())
-        all_labels.append(batch[3].numpy())  # graph labels
+        # ---------- graph bookkeeping (unchanged) ---------------------
+        graph_logits_all.append(g_logits.cpu().numpy())
+        graph_labels_all.append(g_lbl.cpu().numpy())
 
-    logits = np.concatenate(all_logits, 0)
-    labels = np.concatenate(all_labels, 0)
-    preds  = (logits > 0.5)
+        # ---------- line-level bookkeeping ----------------------------
+        lp, lg = aggregate_by_line(                    # now returns probs
+            n_logits.cpu().numpy(),
+            n_lbl.cpu().numpy(),
+            line_ids.cpu().numpy()
+        )
+        line_probs_all.extend(lp)                      # store PROBs
+        line_labels_all.extend(lg)
 
-    precision, recall, f1, fpr, fnr = p_r_f1(labels, preds)
-    auc = roc_auc_score(labels, preds)
+    # ───────────────── graph metrics (as before) ─────────────────────
+    graph_logits = np.concatenate(graph_logits_all, 0)
+    graph_labels = np.concatenate(graph_labels_all, 0)
+    graph_preds  = (graph_logits > 0.5)
+    g_prec, g_rec, g_f1, g_fpr, g_fnr = p_r_f1(graph_labels, graph_preds)
+    g_auc = roc_auc_score(graph_labels, graph_logits)
 
-    # --------------------------------------------------
-    #  write raw predictions for inspection / leaderboard
-    # --------------------------------------------------
-    os.makedirs(args.output_dir, exist_ok=True)
+    # ───────────────── line metrics (use saved threshold) ────────────
+    line_probs  = np.array(line_probs_all)
+    line_labels = np.array(line_labels_all)
+
+    thr = getattr(args, "eval_thr", 0.5)               # <── default 0.5
+    line_preds = (line_probs > thr)
+
+    l_prec, l_rec, l_f1, l_fpr, l_fnr = p_r_f1(line_labels, line_preds)
+    l_auc = roc_auc_score(line_labels, line_probs)     # use probs for AUC
+
+    # optional – still dump graph-level predictions for inspection
     with open(os.path.join(args.output_dir, "predictions.txt"), "w") as fh:
-        for ex, p in zip(test_dataset.examples, preds):
+        for ex, p in zip(test_dataset.examples, graph_preds):
             fh.write(f"{ex.idx}\t{int(p)}\n")
 
     return {
-        "test_acc":       round(float(np.mean(labels == preds)), 4),
-        "test_precision": round(precision, 4),
-        "test_recall":    round(recall, 4),
-        "test_f1":        round(f1, 4),
-        "test_auc":       round(auc, 4),
-        "test_FPR":       round(fpr, 4),
-        "test_FNR":       round(fnr, 4),
+        "test_acc":       round(float(np.mean(line_labels == line_preds)), 4),
+        "test_precision": round(l_prec, 4),
+        "test_recall":    round(l_rec, 4),
+        "test_f1":        round(l_f1, 4),
+        "test_auc":       round(l_auc, 4),
+        "test_FPR":       round(l_fpr, 4),
+        "test_FNR":       round(l_fnr, 4),
+
+        # keep graph numbers for reference
+        "test_graph_f1":  round(g_f1, 4),
     }
                         
 def main():
@@ -778,6 +856,7 @@ def main():
                         help="using attention operation for attention: mul, sum, concat")
     parser.add_argument("--training_percent", default=1., type=float, help="percet of training sample")
     parser.add_argument("--alpha_weight", default=1., type=float, help="percet of training sample")
+    parser.add_argument("--lambda_node", type=float, default=1.0)
 
     input_argument = [
         "--output_dir", "./saved_models",
@@ -787,16 +866,16 @@ def main():
         "--do_eval",
         "--do_test",
         "--do_train",
-        # "--train_data_file", "../dataset/NVD/my_train.jsonl",
-        # "--eval_data_file", "../dataset/NVD/my_valid.jsonl",
-        # "--test_data_file", "../dataset/NVD/my_test.jsonl",
-        "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
-        "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
-        "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
+        "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
+        "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
+        "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
+        # "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
+        # "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
+        # "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
         # "--block_size", "400",
         # "--block_size", "256",
-        # "--block_size", "128",
-        "--block_size", "64",
+        "--block_size", "128",
+        # "--block_size", "64",
         "--fp16",
         # "--train_batch_size", "32",
         "--train_batch_size", "8",
@@ -806,8 +885,9 @@ def main():
         "--evaluate_during_training",
         "--gnn", "ReGCN",
         "--learning_rate", "5e-4",
-        # "--epoch", "200",
-        "--epoch", "10",
+        "--epoch", "100",
+        # "--epoch", "10",
+        # "--epoch", "3",
         "--hidden_size", "128",
         "--num_GNN_layers", "2",
         "--seed", "123456",
