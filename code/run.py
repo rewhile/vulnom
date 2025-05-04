@@ -537,19 +537,16 @@ def aggregate_by_line(node_probs, node_labels, line_ids, thr=0.5):
         if valid.sum() == 0:
             continue
 
-        # probs = 1 / (1 + np.exp(-logit_row[valid]))   # sigmoid
-        # node_pred = probs > thr
-        node_pred = logit_row[valid] > thr
+        # convert logits → probabilities in [0, 1]
+        probs     = 1. / (1. + np.exp(-logit_row[valid]))   # sigmoid
         node_gold = label_row[valid].astype(bool)
         line_row  = line_row[valid]
 
         for ln in np.unique(line_row):
             mask = (line_row == ln)
-            # a line is positive if *any* of its nodes is positive
-            # line_preds.append(int(node_pred[mask].any()))
-            # Let's change to mean
-            line_score = logit_row[valid][mask].mean()
-            line_preds.append(int(line_score > thr))
+            # **average** the node-probs of this source line
+            line_score = probs[mask].mean()
+            line_preds.append(float(line_score))   # ← keep as *prob*, not 0/1
             line_golds.append(int(node_gold[mask].any()))
 
     return line_preds, line_golds
@@ -639,7 +636,9 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
 
     line_preds = (line_probs > best_thr)
     l_prec, l_rec, l_f1, l_fpr, l_fnr = p_r_f1(line_labels, line_preds)
-    l_auc = roc_auc_score(line_labels, line_preds)
+    l_auc = roc_auc_score(line_labels, line_preds.astype(int))
+
+    args.eval_thr = best_thr
 
     return {
         # line-level – these are now the ones used for “best-f1”
@@ -866,12 +865,12 @@ def main():
         "--do_eval",
         "--do_test",
         "--do_train",
-        "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
-        "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
-        "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
-        # "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
-        # "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
-        # "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
+        # "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
+        # "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
+        # "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
+        "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
+        "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
+        "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
         # "--block_size", "400",
         # "--block_size", "256",
         "--block_size", "128",
@@ -885,8 +884,8 @@ def main():
         "--evaluate_during_training",
         "--gnn", "ReGCN",
         "--learning_rate", "5e-4",
-        "--epoch", "100",
-        # "--epoch", "10",
+        # "--epoch", "100",
+        "--epoch", "10",
         # "--epoch", "3",
         "--hidden_size", "128",
         "--num_GNN_layers", "2",
