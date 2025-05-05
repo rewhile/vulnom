@@ -244,7 +244,9 @@ class TextDataset(Dataset):
         self.examples = []
         self.encoder = encoder.to(args.device)
         self.args = args
-        self.w_embeddings = encoder.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
+        emb = encoder.embeddings.word_embeddings.weight.detach().cpu()
+        self.w_embeddings = torch.as_tensor(emb, dtype=torch.float32).share_memory_()
+        # self.w_embeddings = encoder.embeddings.word_embeddings.weight.data.cpu().detach().clone().numpy()
 
         with open(file_path) as f:
             for line in f:
@@ -868,24 +870,28 @@ def main():
         # "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
         # "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
         # "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
-        "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
-        "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
-        "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
+        # "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
+        # "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
+        # "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
+        "--train_data_file", "../dataset/NVD/NVD/my_train.jsonl",
+        "--eval_data_file", "../dataset/NVD/NVD/my_valid.jsonl",
+        "--test_data_file", "../dataset/NVD/NVD/my_test.jsonl",
         # "--block_size", "400",
         # "--block_size", "256",
-        "--block_size", "128",
-        # "--block_size", "64",
+        # "--block_size", "128",
+        "--block_size", "64",
         "--fp16",
         # "--train_batch_size", "32",
         "--train_batch_size", "8",
+        # "--train_batch_size", "4",
         # "--eval_batch_size", "32",
         "--eval_batch_size", "8",
         "--max_grad_norm", "1.0",
         "--evaluate_during_training",
         "--gnn", "ReGCN",
         "--learning_rate", "5e-4",
-        # "--epoch", "100",
-        "--epoch", "10",
+        "--epoch", "100",
+        # "--epoch", "10",
         # "--epoch", "3",
         "--hidden_size", "128",
         "--num_GNN_layers", "2",
