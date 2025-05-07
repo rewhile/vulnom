@@ -517,7 +517,10 @@ def p_r_f1(labels, preds):
     f1 = 2 / (1/precision + 1/recall)
     FPR = (FP + 1) / (TN + FP + 1)
     FNR = (FN + 1) / (TP + FN + 1)
-    return precision, recall, f1, FPR, FNR
+    # -------- MCC ----------
+    denom = math.sqrt((TP+FP)*(TP+FN)*(TN+FP)*(TN+FN) + 1e-7)
+    mcc   = ((TP * TN) - (FP * FN)) / denom if denom else 0.0
+    return precision, recall, f1, FPR, FNR, mcc
 
 # ──────────────────────────────────────────────────────────────────────────────
 def aggregate_by_line(node_probs, node_labels, line_ids, thr=0.5):
@@ -585,6 +588,7 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
     eval_loss, nb_steps = 0.0, 0
     graph_logits_all, graph_labels_all = [], []
     line_probs_all,  line_labels_all  = [], []
+    node_logits_all, node_truth_all, line_id_rows = [], [], []
 
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
         # unpack & send to GPU
@@ -614,6 +618,10 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
         )
         line_probs_all.extend(lp)
         line_labels_all.extend(lg)
+        # cache the per-node stuff
+        node_logits_all.append(n_logits.cpu())
+        node_truth_all.append(n_lbl.cpu())
+        line_id_rows.append(line_ids.cpu())
 
     eval_loss /= nb_steps
         # ───────── graph metrics (unchanged) ────────────────────────────────────
@@ -623,22 +631,36 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
     # g_prec, g_rec, g_f1, g_fpr, g_fnr = p_r_f1(graph_labels, graph_preds)
     # g_auc = roc_auc_score(graph_labels, graph_preds)
     graph_preds   = graph_logits > 0.5
-    g_prec, g_rec, g_f1, g_fpr, g_fnr = p_r_f1(graph_labels, graph_preds)
+    g_prec, g_rec, g_f1, g_fpr, g_fnr, g_mcc = p_r_f1(graph_labels, graph_preds)
     g_auc = roc_auc_score(graph_labels, graph_logits)   # <── use probs
 
     # ───────── line metrics (NEW primary target) ────────────────────────────
     line_probs  = np.array(line_probs_all)
     line_labels = np.array(line_labels_all)
+    l_R = np.corrcoef(line_probs, line_labels)[0, 1]
+
     best_thr, best_f1 = 0.5, -1
     for thr in np.linspace(0.05, 0.95, 19):
         preds_tmp = (line_probs > thr)
-        _, _, f1_tmp, _, _ = p_r_f1(line_labels, preds_tmp)
+        _, _, f1_tmp, _, _, _ = p_r_f1(line_labels, preds_tmp)
         if f1_tmp > best_f1:
             best_f1, best_thr = f1_tmp, thr
 
     line_preds = (line_probs > best_thr)
-    l_prec, l_rec, l_f1, l_fpr, l_fnr = p_r_f1(line_labels, line_preds)
+    l_prec, l_rec, l_f1, l_fpr, l_fnr, l_mcc = p_r_f1(line_labels, line_preds)
     l_auc = roc_auc_score(line_labels, line_preds.astype(int))
+
+    # ---------------- IoU (avg-per-sample) ----------------
+    ious = []
+    for npreds, ntruth, lrow in zip(node_logits_all, node_truth_all, line_id_rows):
+        npreds  = (npreds > 0.5)
+        ntruth  = (ntruth > 0.5)
+        valid   = lrow >= 0
+        u = set(lrow[valid & npreds ].tolist())
+        v = set(lrow[valid & ntruth ].tolist())
+        if u or v:
+            ious.append(len(u & v) / len(u | v))
+    avg_iou = float(np.mean(ious)) if ious else 0.0
 
     args.eval_thr = best_thr
 
@@ -650,14 +672,21 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
         "eval_recall":    round(l_rec, 4),
         "eval_f1":        round(l_f1, 4),            # <── train() looks at this
         "eval_auc":       round(l_auc, 4),
+        "test_MCC":       round(l_mcc, 4),
+        "test_IOU":       round(avg_iou, 4),
         "eval_FPR":       round(l_fpr, 4),
         "eval_FNR":       round(l_fnr, 4),
+        "eval_R":         round(l_R, 4),
 
         # keep graph-level numbers for reference
         "eval_graph_precision": round(g_prec, 4),
         "eval_graph_recall":    round(g_rec, 4),
         "eval_graph_f1":        round(g_f1, 4),
         "eval_graph_auc":       round(g_auc, 4),
+
+        # "node_logits_all": np.concatenate([t.numpy() for t in node_logits_all], 0),
+        # "node_truth_all":  np.concatenate([t.numpy() for t in node_truth_all], 0),
+        # "line_id_rows":    np.concatenate([t.numpy() for t in line_id_rows], 0),
     }
 
 
@@ -867,19 +896,19 @@ def main():
         "--do_eval",
         "--do_test",
         "--do_train",
-        # "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
-        # "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
-        # "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
+        "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
+        "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
+        "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
         # "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
         # "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
         # "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
-        "--train_data_file", "../dataset/NVD/NVD/my_train.jsonl",
-        "--eval_data_file", "../dataset/NVD/NVD/my_valid.jsonl",
-        "--test_data_file", "../dataset/NVD/NVD/my_test.jsonl",
+        # "--train_data_file", "../dataset/NVD/NVD/my_train.jsonl",
+        # "--eval_data_file", "../dataset/NVD/NVD/my_valid.jsonl",
+        # "--test_data_file", "../dataset/NVD/NVD/my_test.jsonl",
         # "--block_size", "400",
         # "--block_size", "256",
-        # "--block_size", "128",
-        "--block_size", "64",
+        "--block_size", "128",
+        # "--block_size", "64",
         "--fp16",
         # "--train_batch_size", "32",
         "--train_batch_size", "8",
