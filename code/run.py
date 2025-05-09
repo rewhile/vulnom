@@ -991,12 +991,13 @@ def main():
         "--block_size", "64",
         # "--block_size", "1", # only for debugging purposes
         # "--block_size", "64",
-        "--fp16",
-        # "--train_batch_size", "32",
-        "--train_batch_size", "8",
+        # "--fp16",
+        "--train_batch_size", "32",
+        # "--train_batch_size", "8",
         # "--train_batch_size", "4",
-        # "--eval_batch_size", "32",
-        "--eval_batch_size", "8",
+
+        "--eval_batch_size", "32",
+        # "--eval_batch_size", "8",
         "--max_grad_norm", "1.0",
         "--evaluate_during_training",
         "--gnn", "ReGCN",
