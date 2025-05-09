@@ -3,4 +3,5 @@ dataset/GITA
 dataset/SARD
 dataset.zip
 code/saved_models
+code/results.txt
 __pycache__/

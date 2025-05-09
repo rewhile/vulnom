@@ -2,6 +2,7 @@
 from __future__ import absolute_import, division, print_function
 
 import argparse
+from collections import defaultdict
 import glob
 import logging
 import os
@@ -126,7 +127,8 @@ class InputFeatures(object):
                  idx,
                  label,
                  node_target,
-                 code_lines
+                 code_lines,
+                 cwe
 
     ):
         self.all_ids = all_ids,
@@ -137,12 +139,17 @@ class InputFeatures(object):
         self.label = label
         self.node_target = node_target
         self.code_lines = code_lines
+        self.cwe = cwe
 
 
 def convert_graphs_to_features(js,tokenizer, args):
     codes = js['nodes_codes']
     edges = js['edges']
     edges_label = []
+    # ─ extract CWE (first “CWE123” in the filename) ────────────────────────
+    filename = js["filename"]
+    m = re.search(r"(CWE\d+)", filename)
+    cwe_id = m.group(1) if m else "UNKNOWN"
     edges_label_source = js['edges_label']
     for i, label in enumerate(edges_label_source):
         if len(label) != 0:
@@ -168,7 +175,7 @@ def convert_graphs_to_features(js,tokenizer, args):
     if num_nodes == 0:
         return None
 
-    return InputFeatures(all_ids, edges, edges_label, num_nodes, js['idx'], js['target'], js['node_target'], js['code_lines'])
+    return InputFeatures(all_ids, edges, edges_label, num_nodes, js['idx'], js['target'], js['node_target'], js['code_lines'], cwe_id)
 
 def convert_codes_to_tokens(js, args):
     codes = js['nodes_codes']
@@ -314,10 +321,12 @@ class TextDataset(Dataset):
         lines = np.pad(lines, (0, pad), "constant", constant_values=-1)
 
         line_tensor = torch.tensor(lines, dtype=torch.float)
+        line_tensor = torch.tensor(lines, dtype=torch.float)
+        cwe_id = self.examples[i].cwe          #  NEW
 
         return (adj_tensor, adj_mask_tensor, feat_tensor,
                 graph_lbl,  node_lbl,         node_msk,
-                line_tensor)
+                line_tensor, cwe_id)
 
 
 
@@ -436,7 +445,17 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
         #     model.train()
         #     loss, logits = model(adj, adj_mask, adj_feature, labels, n_label)
             # ignore code_lines during training
-            adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, _ = (t.to(args.device) for t in batch)
+            # adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, _ = (t.to(args.device) for t in batch)
+            # first 7 items are tensors, last one is a plain str (cwe)
+            *tensor_parts, cwe_ids = batch
+            adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = tensor_parts
+            adj      = adj.to(args.device)
+            adj_mask = adj_mask.to(args.device)
+            adj_feat = adj_feat.to(args.device)
+            g_lbl    = g_lbl.to(args.device)
+            n_lbl    = n_lbl.to(args.device)
+            n_msk    = n_msk.to(args.device)
+            line_ids = line_ids.to(args.device)
             model.train()
             loss, _, _ = model(adj, adj_mask, adj_feat, graph_labels=g_lbl, node_labels =n_lbl, node_mask   =n_msk)
 
@@ -478,8 +497,15 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                         results = evaluate(args, eval_dataset, model, tokenizer,eval_when_training=True)
                         my_metric = []
                         for key, value in results.items():
-                            logger.info("  %s = %s", key, round(value,4))
-                            my_metric.append(round(value,4))
+                            # logger.info("  %s = %s", key, round(value,4))
+                            if key == "per_cwe_auc":
+                                for cwe, auc in value.items():
+                                    logger.info(f"    {cwe}: {auc}")
+                                my_metric.append(float(value))
+                            else:
+                                logger.info("  %s = %s", key, value)
+                            # my_metric.append(round(value,4))
+                                my_metric.append(value)
                         my_metrics.append(my_metric)
                         # Save model checkpoint
                         
@@ -550,6 +576,8 @@ def aggregate_by_line(node_probs, node_labels, line_ids, thr=0.5):
         for ln in np.unique(line_row):
             mask = (line_row == ln)
             # **average** the node-probs of this source line
+            # line_score = probs[mask].mean()
+            # line_score = probs[mask].max()
             line_score = probs[mask].mean()
             line_preds.append(float(line_score))   # ← keep as *prob*, not 0/1
             line_golds.append(int(node_gold[mask].any()))
@@ -587,14 +615,26 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
     model.eval()
     eval_loss, nb_steps = 0.0, 0
     graph_logits_all, graph_labels_all = [], []
-    line_probs_all,  line_labels_all  = [], []
+    line_probs_all,  line_labels_all, line_cwes_all  = [], [], []
     node_logits_all, node_truth_all, line_id_rows = [], [], []
+    per_cwe = defaultdict(lambda : {"labels": [], "probs": []})
 
     for batch in tqdm(eval_dataloader, desc="Evaluating", leave=False):
         # unpack & send to GPU
-        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (
-            t.to(args.device) for t in batch
-        )
+        # adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids, cwe_ids = (
+        #     t.to(args.device) for t in batch
+        # )
+
+        *tensor_parts, cwe_ids = batch
+        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = tensor_parts
+        adj      = adj.to(args.device)
+        adj_mask = adj_mask.to(args.device)
+        adj_feat = adj_feat.to(args.device)
+        g_lbl    = g_lbl.to(args.device)
+        n_lbl    = n_lbl.to(args.device)
+        n_msk    = n_msk.to(args.device)
+        line_ids = line_ids.to(args.device)
+        # cwe_ids = batch[-1]
 
         with torch.no_grad():
             loss, g_logits, n_logits = model(
@@ -607,17 +647,35 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
         # ─── graph-level bookkeeping ────────────────────────────────────────
         eval_loss += loss.item()
         nb_steps  += 1
-        graph_logits_all.append(g_logits.cpu().numpy())
-        graph_labels_all.append(g_lbl.cpu().numpy())
+        # graph_logits_all.append(g_logits.cpu().numpy())
+        # graph_labels_all.append(g_lbl.cpu().numpy())
+        gl_cpu = g_logits.cpu().numpy()
+        lb_cpu = g_lbl.cpu().numpy()
+        graph_logits_all.append(gl_cpu)
+        graph_labels_all.append(lb_cpu)
+        # ── per-CWE accumulation ───────────────────────────────
+        for p, y, c in zip(gl_cpu, lb_cpu, cwe_ids):
+            per_cwe[c]["probs"].append(float(p))
+            per_cwe[c]["labels"].append(int(y))
 
         # ─── NEW: line-level bookkeeping ────────────────────────────────────
-        lp, lg = aggregate_by_line(
-            n_logits.cpu().numpy(),
-            n_lbl.cpu().numpy(),
-            line_ids.cpu().numpy()
-        )
-        line_probs_all.extend(lp)
-        line_labels_all.extend(lg)
+        # lp, lg = aggregate_by_line(
+        #     n_logits.cpu().numpy(),
+        #     n_lbl.cpu().numpy(),
+        #     line_ids.cpu().numpy()
+        # )
+        # line_probs_all.extend(lp)
+        # line_labels_all.extend(lg)
+        # ---- store per-line predictions together with CWEs ---------------
+        for i in range(len(cwe_ids)):               # loop inside mini-batch
+            lp, lg = aggregate_by_line(
+                n_logits[i:i+1].cpu().numpy(),
+                n_lbl[i:i+1].cpu().numpy(),
+                line_ids[i:i+1].cpu().numpy()
+            )
+            line_probs_all.extend(lp)
+            line_labels_all.extend(lg)
+            line_cwes_all.extend([cwe_ids[i]] * len(lp))   #  NEW
         # cache the per-node stuff
         node_logits_all.append(n_logits.cpu())
         node_truth_all.append(n_lbl.cpu())
@@ -664,6 +722,17 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
 
     args.eval_thr = best_thr
 
+    # ───────────────── per-CWE metrics ─────────────────────────────────────
+    # ------------ per-CWE AUC table -------------------------------
+    per_cwe_auc = {}
+    for cwe, d in per_cwe.items():
+        lbls, prbs = d["labels"], d["probs"]
+        if len(set(lbls)) == 2:               # need both 0 and 1
+            per_cwe_auc[cwe] = round(roc_auc_score(lbls, prbs), 4)
+        else:
+            per_cwe_auc[cwe] = "N/A"          # undefined AUC
+
+
     return {
         # line-level – these are now the ones used for “best-f1”
         "eval_loss":      round(float(eval_loss/nb_steps), 6),
@@ -677,6 +746,7 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
         "eval_FPR":       round(l_fpr, 4),
         "eval_FNR":       round(l_fnr, 4),
         "eval_R":         round(l_R, 4),
+        "eval_auc_per_CWE": per_cwe_auc,
 
         # keep graph-level numbers for reference
         "eval_graph_precision": round(g_prec, 4),
@@ -716,7 +786,7 @@ def test(args, test_dataset, model, tokenizer):
     model.eval()
 
     graph_logits_all, graph_labels_all = [], []
-    line_probs_all,  line_labels_all   = [] , []       # <── keep PROBs
+    line_probs_all,  line_labels_all   = [], []       # <── keep PROBs
 
     for batch in tqdm(test_loader, desc="Testing", leave=False):
         adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (
@@ -896,18 +966,30 @@ def main():
         "--do_eval",
         "--do_test",
         "--do_train",
-        "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
-        "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
-        "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
+        # "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
+        # "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
+        # "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
+
         # "--train_data_file", "../dataset/GITA/openssl/my_train.jsonl",
         # "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
         # "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
+
         # "--train_data_file", "../dataset/NVD/NVD/my_train.jsonl",
         # "--eval_data_file", "../dataset/NVD/NVD/my_valid.jsonl",
         # "--test_data_file", "../dataset/NVD/NVD/my_test.jsonl",
+
+        # "--train_data_file", "../dataset/GITA/Linux/my_train.jsonl",
+        # "--eval_data_file", "../dataset/GITA/Linux/my_valid.jsonl",
+        # "--test_data_file", "../dataset/GITA/Linux/my_test.jsonl",
+
+        "--train_data_file", "../dataset/GITA/Libav/my_train.jsonl",
+        "--eval_data_file", "../dataset/GITA/Libav/my_valid.jsonl",
+        "--test_data_file", "../dataset/GITA/Libav/my_test.jsonl",
         # "--block_size", "400",
         # "--block_size", "256",
-        "--block_size", "128",
+        # "--block_size", "128",
+        "--block_size", "64",
+        # "--block_size", "1", # only for debugging purposes
         # "--block_size", "64",
         "--fp16",
         # "--train_batch_size", "32",
