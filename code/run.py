@@ -522,12 +522,13 @@ def train(args, train_dataset, eval_dataset, model, tokenizer):
                         logger.info("  Best f1:%s",round(best_f1,4))
                         logger.info("  "+"*"*20)                          
                         
-                        checkpoint_prefix = 'checkpoint-best-f1'
+                        # checkpoint_prefix = 'checkpoint-best-f1'
+                        checkpoint_prefix = 'Linux'
                         output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))                        
                         if not os.path.exists(output_dir):
                             os.makedirs(output_dir)                        
                         model_to_save = model.module if hasattr(model,'module') else model
-                        output_dir = os.path.join(output_dir, '{}'.format('model.bin')) 
+                        output_dir = os.path.join(output_dir, '{}'.format('Linux.bin')) 
                         torch.save(model_to_save.state_dict(), output_dir)
                         logger.info("Saving model checkpoint to %s", output_dir)
         avg_loss = round(train_loss / tr_num, 5)
@@ -584,8 +585,8 @@ def aggregate_by_line(node_probs, node_labels, line_ids, thr=0.5):
             mask = (line_row == ln)
             # **average** the node-probs of this source line
             # line_score = probs[mask].mean()
-            # line_score = probs[mask].max()
-            line_score = probs[mask].mean()
+            line_score = probs[mask].max()
+            # line_score = probs[mask].mean()
             line_preds.append(float(line_score))   # ← keep as *prob*, not 0/1
             line_golds.append(int(node_gold[mask].any()))
 
@@ -728,6 +729,9 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
     avg_iou = float(np.mean(ious)) if ious else 0.0
 
     args.eval_thr = best_thr
+    thr_path = os.path.join(args.output_dir, "best_thr.txt")
+    with open(thr_path, "w") as fh:
+        fh.write(f"{best_thr:.6f}")
 
     # ───────────────── per-CWE metrics ─────────────────────────────────────
     # ------------ per-CWE AUC table -------------------------------
@@ -748,8 +752,8 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
         "eval_recall":    round(l_rec, 4),
         "eval_f1":        round(l_f1, 4),            # <── train() looks at this
         "eval_auc":       round(l_auc, 4),
-        "test_MCC":       round(l_mcc, 4),
-        "test_IOU":       round(avg_iou, 4),
+        "eval_MCC":       round(l_mcc, 4),
+        "eval_IOU":       round(avg_iou, 4),
         "eval_FPR":       round(l_fpr, 4),
         "eval_FNR":       round(l_fnr, 4),
         "eval_R":         round(l_R, 4),
@@ -769,15 +773,15 @@ def evaluate(args, eval_dataset, model, tokenizer, eval_when_training=False):
 
 def test(args, test_dataset, model, tokenizer):
     """
-    Run test on held-out set and write predictions.txt
-    Works with the 5-tensor batches.
+    Run test on the held-out set.
+    Produces the same metrics & return-dict keys as `evaluate()`.
     """
+    # ---------- loader -------------------------------------------------
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    sampler_cls = SequentialSampler if args.local_rank == -1 else DistributedSampler
-    test_sampler = sampler_cls(test_dataset)
-    test_loader  = DataLoader(
+    sampler_cls          = SequentialSampler if args.local_rank == -1 else DistributedSampler
+    test_loader          = DataLoader(
         test_dataset,
-        sampler     = test_sampler,
+        sampler     = sampler_cls(test_dataset),
         batch_size  = args.eval_batch_size,
         num_workers = 4,
         pin_memory  = True,
@@ -792,64 +796,105 @@ def test(args, test_dataset, model, tokenizer):
 
     model.eval()
 
-    graph_logits_all, graph_labels_all = [], []
-    line_probs_all,  line_labels_all   = [], []       # <── keep PROBs
+    # ---------- accumulators ------------------------------------------
+    graph_logits_all, graph_labels_all     = [], []
+    line_probs_all,  line_labels_all       = [], []
+    node_logits_all, node_truth_all        = [], []
+    line_id_rows                           = []
+    per_cwe = defaultdict(lambda: {"labels": [], "probs": []})
 
+    # ---------- loop ---------------------------------------------------
     for batch in tqdm(test_loader, desc="Testing", leave=False):
-        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = (
-            t.to(args.device) for t in batch
-        )
+        # (*tensor_parts, cwe_ids) ↔ exactly like evaluate()
+        *tensor_parts, cwe_ids = batch
+        adj, adj_mask, adj_feat, g_lbl, n_lbl, n_msk, line_ids = tensor_parts
+        adj, adj_mask, adj_feat = adj.to(args.device), adj_mask.to(args.device), adj_feat.to(args.device)
+        g_lbl, n_lbl, n_msk     = g_lbl.to(args.device), n_lbl.to(args.device), n_msk.to(args.device)
+        line_ids                = line_ids.to(args.device)
 
-        # ── forward pass – the model must return *probabilities* here ──
+        # forward **without** loss – we only need the probabilities
         with torch.no_grad():
             g_logits, n_logits = model(adj, adj_mask, adj_feat)
 
-        # ---------- graph bookkeeping (unchanged) ---------------------
-        graph_logits_all.append(g_logits.cpu().numpy())
-        graph_labels_all.append(g_lbl.cpu().numpy())
+        # ----- graph-level bookkeeping ---------------------------------
+        gl_cpu, lb_cpu = g_logits.cpu().numpy(), g_lbl.cpu().numpy()
+        graph_logits_all.append(gl_cpu)
+        graph_labels_all.append(lb_cpu)
+        for p, y, c in zip(gl_cpu, lb_cpu, cwe_ids):
+            per_cwe[c]["probs"].append(float(p))
+            per_cwe[c]["labels"].append(int(y))
 
-        # ---------- line-level bookkeeping ----------------------------
-        lp, lg = aggregate_by_line(                    # now returns probs
-            n_logits.cpu().numpy(),
-            n_lbl.cpu().numpy(),
-            line_ids.cpu().numpy()
-        )
-        line_probs_all.extend(lp)                      # store PROBs
-        line_labels_all.extend(lg)
+        # ----- line-level bookkeeping ----------------------------------
+        for i in range(len(cwe_ids)):          # per sample in batch
+            lp, lg = aggregate_by_line(
+                n_logits[i:i+1].cpu().numpy(),
+                n_lbl[i:i+1].cpu().numpy(),
+                line_ids[i:i+1].cpu().numpy()
+            )
+            line_probs_all.extend(lp)
+            line_labels_all.extend(lg)
 
-    # ───────────────── graph metrics (as before) ─────────────────────
+        # ----- IoU bookkeeping (per-node caches) -----------------------
+        node_logits_all.append(n_logits.cpu())
+        node_truth_all.append(n_lbl.cpu())
+        line_id_rows.append(line_ids.cpu())
+
+    # ---------------- metrics ------------------------------------------
     graph_logits = np.concatenate(graph_logits_all, 0)
     graph_labels = np.concatenate(graph_labels_all, 0)
-    graph_preds  = (graph_logits > 0.5)
-    g_prec, g_rec, g_f1, g_fpr, g_fnr = p_r_f1(graph_labels, graph_preds)
+    g_prec, g_rec, g_f1, g_fpr, g_fnr, g_mcc = p_r_f1(graph_labels, graph_logits > 0.5)
     g_auc = roc_auc_score(graph_labels, graph_logits)
 
-    # ───────────────── line metrics (use saved threshold) ────────────
     line_probs  = np.array(line_probs_all)
     line_labels = np.array(line_labels_all)
+    thr         = getattr(args, "eval_thr", 0.5)
+    line_preds  = (line_probs > thr)
+    l_prec, l_rec, l_f1, l_fpr, l_fnr, l_mcc = p_r_f1(line_labels, line_preds)
+    l_auc = roc_auc_score(line_labels, line_preds.astype(int))
+    l_R   = np.corrcoef(line_probs, line_labels)[0, 1]
 
-    thr = getattr(args, "eval_thr", 0.5)               # <── default 0.5
-    line_preds = (line_probs > thr)
+    # IoU (average over samples)
+    ious = []
+    for npreds, ntruth, lrow in zip(node_logits_all, node_truth_all, line_id_rows):
+        npreds = (npreds > 0.5)
+        ntruth = (ntruth > 0.5)
+        valid  = lrow >= 0
+        u = set(lrow[valid & npreds].tolist())
+        v = set(lrow[valid & ntruth].tolist())
+        if u or v:
+            ious.append(len(u & v) / len(u | v))
+    avg_iou = float(np.mean(ious)) if ious else 0.0
 
-    l_prec, l_rec, l_f1, l_fpr, l_fnr = p_r_f1(line_labels, line_preds)
-    l_auc = roc_auc_score(line_labels, line_probs)     # use probs for AUC
+    # per-CWE AUC -------------------------------------------------------
+    per_cwe_auc = {}
+    for cwe, d in per_cwe.items():
+        lbls, prbs = d["labels"], d["probs"]
+        per_cwe_auc[cwe] = round(roc_auc_score(lbls, prbs), 4) if len(set(lbls)) == 2 else "N/A"
 
-    # optional – still dump graph-level predictions for inspection
+    # optional flat predictions file (graph-level)
     with open(os.path.join(args.output_dir, "predictions.txt"), "w") as fh:
-        for ex, p in zip(test_dataset.examples, graph_preds):
+        for ex, p in zip(test_dataset.examples, (graph_logits > 0.5)):
             fh.write(f"{ex.idx}\t{int(p)}\n")
 
+    # ---------------- return dict -------------------------------------
     return {
         "test_acc":       round(float(np.mean(line_labels == line_preds)), 4),
         "test_precision": round(l_prec, 4),
         "test_recall":    round(l_rec, 4),
         "test_f1":        round(l_f1, 4),
         "test_auc":       round(l_auc, 4),
+        "test_MCC":       round(l_mcc, 4),
+        "test_IOU":       round(avg_iou, 4),
         "test_FPR":       round(l_fpr, 4),
         "test_FNR":       round(l_fnr, 4),
+        "test_R":         round(l_R,   4),
+        "test_auc_per_CWE": per_cwe_auc,
 
-        # keep graph numbers for reference
-        "test_graph_f1":  round(g_f1, 4),
+        # graph-level – for reference
+        "test_graph_precision": round(g_prec, 4),
+        "test_graph_recall":    round(g_rec, 4),
+        "test_graph_f1":        round(g_f1, 4),
+        "test_graph_auc":       round(g_auc, 4),
     }
                         
 def main():
@@ -963,7 +1008,7 @@ def main():
                         help="using attention operation for attention: mul, sum, concat")
     parser.add_argument("--training_percent", default=1., type=float, help="percet of training sample")
     parser.add_argument("--alpha_weight", default=1., type=float, help="percet of training sample")
-    parser.add_argument("--lambda_node", type=float, default=1.0)
+    parser.add_argument("--lambda_node", type=float, default=3.0)
 
     input_argument = [
         "--output_dir", "./saved_models",
@@ -973,6 +1018,7 @@ def main():
         "--do_eval",
         "--do_test",
         "--do_train",
+
         # "--train_data_file", "../dataset/SARD/SARD/my_train.jsonl",
         # "--eval_data_file", "../dataset/SARD/SARD/my_valid.jsonl",
         # "--test_data_file", "../dataset/SARD/SARD/my_test.jsonl",
@@ -981,37 +1027,55 @@ def main():
         # "--eval_data_file", "../dataset/GITA/openssl/my_valid.jsonl",
         # "--test_data_file", "../dataset/GITA/openssl/my_test.jsonl",
 
+        # "--train_data_file", "../dataset/GITA/openssl2/my_train.jsonl",
+        # "--eval_data_file", "../dataset/GITA/openssl2/my_valid.jsonl",
+        # "--test_data_file", "../dataset/GITA/openssl2/my_test.jsonl",
+
         # "--train_data_file", "../dataset/NVD/NVD/my_train.jsonl",
         # "--eval_data_file", "../dataset/NVD/NVD/my_valid.jsonl",
         # "--test_data_file", "../dataset/NVD/NVD/my_test.jsonl",
+
+        # "--train_data_file", "../dataset/NVD/NVD2/my_train.jsonl",
+        # "--eval_data_file", "../dataset/NVD/NVD2/my_valid.jsonl",
+        # "--test_data_file", "../dataset/NVD/NVD2/my_test.jsonl",
 
         # "--train_data_file", "../dataset/GITA/Linux/my_train.jsonl",
         # "--eval_data_file", "../dataset/GITA/Linux/my_valid.jsonl",
         # "--test_data_file", "../dataset/GITA/Linux/my_test.jsonl",
 
-        "--train_data_file", "../dataset/GITA/Libav/my_train.jsonl",
-        "--eval_data_file", "../dataset/GITA/Libav/my_valid.jsonl",
-        "--test_data_file", "../dataset/GITA/Libav/my_test.jsonl",
+        "--train_data_file", "../dataset/GITA/Linux2/my_train.jsonl",
+        "--eval_data_file", "../dataset/GITA/Linux2/my_valid.jsonl",
+        "--test_data_file", "../dataset/GITA/Linux2/my_test.jsonl",
+
+        # "--train_data_file", "../dataset/GITA/Linux/my_train.jsonl",
+        # "--eval_data_file", "../dataset/GITA/Linux/my_valid.jsonl",
+        # "--test_data_file", "../dataset/GITA/Linux/my_test.jsonl",
+
+        # "--train_data_file", "../dataset/GITA/Linux2/my_train.jsonl",
+        # "--eval_data_file", "../dataset/GITA/Linux2/my_valid.jsonl",
+        # "--test_data_file", "../dataset/GITA/Linux2/my_test.jsonl",
+
         # "--block_size", "400",
         # "--block_size", "256",
-        # "--block_size", "128",
-        "--block_size", "64",
+        "--block_size", "128",
+        # "--block_size", "64",
         # "--block_size", "1", # only for debugging purposes
         # "--block_size", "64",
         # "--fp16",
         # "--train_batch_size", "32",
-        "--train_batch_size", "128",
-        # "--train_batch_size", "8",
+        # "--train_batch_size", "128",
+        "--train_batch_size", "8",
         # "--train_batch_size", "4",
 
         # "--eval_batch_size", "32",
-        "--eval_batch_size", "128",
-        # "--eval_batch_size", "8",
+        # "--eval_batch_size", "128",
+        "--eval_batch_size", "8",
         "--max_grad_norm", "1.0",
         "--evaluate_during_training",
         "--gnn", "ReGCN",
         "--learning_rate", "5e-4",
-        "--epoch", "100",
+        "--epoch", "200",
+        # "--epoch", "100",
         # "--epoch", "10",
         # "--epoch", "3",
         "--hidden_size", "128",
@@ -1105,25 +1169,65 @@ def main():
     # Evaluation
     results = {}
     if args.do_eval and args.local_rank in [-1, 0]:
-            checkpoint_prefix = 'checkpoint-best-f1/model.bin'
-            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
-            model.load_state_dict(torch.load(output_dir))      
-            model.to(args.device)
-            result=evaluate(args, eval_dataset, model, tokenizer)
-            logger.info("***** Eval results *****")
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(round(result[key],4)))
+        # checkpoint_prefix = 'checkpoint-best-f1/model.bin'
+        checkpoint_prefix = 'Linux/Linux.bin'
+        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
+        model.load_state_dict(torch.load(output_dir))      
+        model.to(args.device)
+        result=evaluate(args, eval_dataset, model, tokenizer)
+        logger.info("***** Eval results *****")
+        # for key in sorted(result.keys()):
+        #     logger.info("  %s = %s", key, str(round(result[key],4)))
+        for key, val in result.items():
+            # numpy scalars → native Python float
+            if isinstance(val, np.generic):
+                val = float(val)
+
+            # pretty-print per-CWE dicts
+            if isinstance(val, dict):
+                fmt = {k: (round(float(v), 4) if isinstance(v, (float, np.floating))
+                        else v)
+                    for k, v in val.items()}
+                logger.info("  %s = %s", key, fmt)
+
+            # plain scalars
+            else:
+                logger.info("  %s = %.4f", key, val)
             
     if args.do_test and args.local_rank in [-1, 0]:
-            checkpoint_prefix = 'checkpoint-best-f1/model.bin'
-            output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
-            model.load_state_dict(torch.load(output_dir))                  
-            model.to(args.device)
-            test_result = test(args, test_dataset, model, tokenizer)
 
-            logger.info("***** Test results *****")
-            for key in sorted(test_result.keys()):
-                logger.info("  %s = %s", key, str(round(test_result[key],4)))
+        thr_path = os.path.join(args.output_dir, "best_thr.txt")
+        if os.path.exists(thr_path):
+            with open(thr_path) as fh:
+                args.eval_thr = float(fh.read().strip())
+        else:
+            print("[warn] best_thr.txt not found - falling back to 0.5")
+
+        # checkpoint_prefix = 'checkpoint-best-f1/model.bin'
+        checkpoint_prefix = 'Linux/Linux.bin'
+        output_dir = os.path.join(args.output_dir, '{}'.format(checkpoint_prefix))  
+        model.load_state_dict(torch.load(output_dir))                  
+        model.to(args.device)
+        test_result = test(args, test_dataset, model, tokenizer)
+
+        logger.info("***** Test results *****")
+        # for key in sorted(test_result.keys()):
+        #     logger.info("  %s = %s", key, str(round(test_result[key],4)))
+        for key, val in test_result.items():
+            # numpy scalars → native Python float
+            if isinstance(val, np.generic):
+                val = float(val)
+
+            # pretty-print per-CWE dicts
+            if isinstance(val, dict):
+                fmt = {k: (round(float(v), 4) if isinstance(v, (float, np.floating))
+                        else v)
+                    for k, v in val.items()}
+                logger.info("  %s = %s", key, fmt)
+
+            # plain scalars
+            else:
+                logger.info("  %s = %.4f", key, val)
 
     return results
 

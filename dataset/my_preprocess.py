@@ -6,7 +6,11 @@ import random
 import pandas as pd
 import sklearn
 
-project = "GITA/Libav"
+# project = "GITA/Libav"
+# project = "GITA/NVD2"
+# project = "GITA/Libav2"
+project = "GITA/Linux2"
+# project = "GITA/openssl2"
 js_all = pd.read_json(open(f'{project}_PrVCs.json'))
 js_all = js_all.to_dict('records')
 
