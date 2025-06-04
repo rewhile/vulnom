@@ -131,7 +131,11 @@ class InputFeatures(object):
                  cwe
 
     ):
-        self.all_ids = all_ids,
+        # `all_ids` is already a list of token-id sequences for each node.  The
+        # trailing comma here turned it into a tuple containing that list which
+        # then required callers to index `[0]` to retrieve the real data.
+        # Store the list directly instead.
+        self.all_ids = all_ids
         self.edges = edges
         self.edges_label = edges_label
         self.num_nodes = num_nodes
@@ -189,8 +193,11 @@ def convert_codes_to_tokens(js, args):
 
 # build graph function
 def build_graph(node_idxs, nodes_edges, num_nodes, edges_label, w_embeddings, args):
+    # `node_idxs` is expected to be a list of token-id sequences for all nodes.
+    # Older versions wrapped this list in an extra container which required
+    # unwrapping here.  After fixing `InputFeatures` we receive the list
+    # directly, so we remove the unnecessary indexing.
     # print('using window size = ', window_size)
-    node_idxs = node_idxs[0]
     edges = nodes_edges + [[y, x] for x, y in nodes_edges]
     edges_label = edges_label + edges_label
     adj_list = []
